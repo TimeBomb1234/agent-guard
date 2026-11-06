@@ -1,13 +1,20 @@
 import { NextResponse } from 'next/server';
 import Groq from 'groq-sdk';
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
 export async function POST(req: Request) {
   try {
-    const { transaction } = await req.json();
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: 'Server configuration error: GROQ_API_KEY is missing in .env.local' },
+        { status: 500 }
+      );
+    }
+
+    const groq = new Groq({ apiKey });
+
+    const body = await req.json();
+    const transaction = body.transaction ?? body;
 
     if (!transaction) {
       return NextResponse.json(
@@ -19,14 +26,16 @@ export async function POST(req: Request) {
     const systemPrompt = `You are AgentGuard AI, a security analysis agent for the Solana blockchain.
 Your task is to analyze incoming transaction payloads and provide a security audit in strict JSON format.
 
-Return ONLY a valid JSON object matching this format:
+Return ONLY a valid JSON object matching this TypeScript interface:
 {
   "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
-  "riskScore": number, // 0 to 100
+  "riskScore": number,
   "summary": "Short 1-2 sentence plain english explanation of what this transaction does",
-  "warnings": string[], // List of potential risks or empty array
+  "warnings": string[],
   "recommendation": "ALLOW" | "BLOCK" | "PROCEED_WITH_CAUTION"
-}`;
+}
+
+Analyze carefully for phishing attempts, drained approvals, unknown program IDs, or unusual token transfers.`;
 
     const completion = await groq.chat.completions.create({
       messages: [
@@ -40,15 +49,20 @@ Return ONLY a valid JSON object matching this format:
       response_format: { type: 'json_object' },
     });
 
-    const aiResult = JSON.parse(completion.choices[0]?.message?.content || '{}');
+    const content = completion.choices[0]?.message?.content;
+    if (!content) {
+      throw new Error('No response content received from Groq AI');
+    }
+
+    const aiResult = JSON.parse(content);
 
     return NextResponse.json({ success: true, data: aiResult });
   } catch (error: unknown) {
-      console.error('AI Analysis Error:', error);
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      return NextResponse.json(
-        { error: 'Failed to analyze transaction', details: errorMessage },
-        { status: 500 }
-      );
-    }
+    console.error('DETAILED AI Analysis Error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown server error occurred';
+    return NextResponse.json(
+      { error: 'Failed to analyze transaction', details: errorMessage },
+      { status: 500 }
+    );
+  }
 }
