@@ -45,7 +45,7 @@ Analyze carefully for phishing attempts, drained approvals, unknown program IDs,
           content: `Analyze this Solana transaction: ${JSON.stringify(transaction, null, 2)}`,
         },
       ],
-      model: 'llama-3.3-70b-versatile',
+      model: 'qwen/qwen3.8-27b',
       response_format: { type: 'json_object' },
     });
 
@@ -61,8 +61,8 @@ Analyze carefully for phishing attempts, drained approvals, unknown program IDs,
     console.error('DETAILED AI Analysis Error:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown server error occurred';
     return NextResponse.json(
-      { error: 'Failed to analyze transaction', details: errorMessage },
-      { status: 500 }
-    );
+          { error: 'Failed to analyze transaction', details: errorMessage },
+          { status: 500 }
+        );
   }
 }
