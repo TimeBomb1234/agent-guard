@@ -2,8 +2,9 @@
 
 import dynamic from 'next/dynamic';
 import { useEffect, useMemo, useState } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
-import { PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
+import type { CSSProperties, FormEvent } from 'react';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import '@solana/wallet-adapter-react-ui/styles.css';
 
 /* The wallet button reads browser state, so it must render on the client only. */
@@ -26,6 +27,13 @@ interface ReportMeta {
   wallet: string | null;
 }
 
+/** Progress of the live send after the AI audit. */
+interface TxStatus {
+  kind: 'pending' | 'success' | 'blocked' | 'error';
+  message: string;
+  signature?: string;
+}
+
 interface AnalysisResult {
   riskLevel: RiskLevel;
   riskScore: number; // 0 - 100
@@ -38,9 +46,61 @@ interface AnalysisResult {
 /* Sample payloads                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Test recipient and amount for the live wallet check (0.1 SOL). */
-const LIVE_TEST_DESTINATION = '47eFuHR9ste9kopiJ9eRxcwahmE62JovbKe5r7AjANut';
-const LIVE_TEST_LAMPORTS = 100000000;
+/** Background glow layers, plain CSS so they render regardless of Tailwind setup. */
+interface GlowLayer {
+  style: CSSProperties;
+  drift: boolean;
+}
+
+const GLOW_LAYERS: GlowLayer[] = [
+  {
+    // Wide spotlight behind the hero
+    drift: false,
+    style: {
+      top: -280,
+      left: '50%',
+      width: 1200,
+      height: 700,
+      marginLeft: -600,
+      background:
+        'radial-gradient(closest-side, rgba(34, 211, 238, 0.20), rgba(34, 211, 238, 0.07) 55%, transparent 100%)',
+    },
+  },
+  {
+    drift: true,
+    style: {
+      top: '26%',
+      right: -220,
+      width: 560,
+      height: 560,
+      background:
+        'radial-gradient(closest-side, rgba(16, 185, 129, 0.16), rgba(16, 185, 129, 0.05) 60%, transparent 100%)',
+      animationDuration: '32s',
+    },
+  },
+  {
+    drift: true,
+    style: {
+      bottom: -160,
+      left: -200,
+      width: 620,
+      height: 620,
+      background:
+        'radial-gradient(closest-side, rgba(6, 182, 212, 0.14), rgba(6, 182, 212, 0.04) 60%, transparent 100%)',
+      animationDuration: '38s',
+      animationDelay: '-12s',
+    },
+  },
+];
+
+const GLOW_KEYFRAMES = `
+@keyframes ag-drift {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  100% { transform: translate3d(48px, -36px, 0) scale(1.08); }
+}
+.ag-drift { animation-name: ag-drift; animation-timing-function: ease-in-out; animation-iteration-count: infinite; animation-direction: alternate; }
+@media (prefers-reduced-motion: reduce) { .ag-drift { animation: none; } }
+`;
 
 const RISKY_SAMPLE = JSON.stringify(
   {
@@ -71,32 +131,6 @@ const RISKY_SAMPLE = JSON.stringify(
           recipient: 'Fq3mHs8YxN2cLpV7bTgW1dKe5uRjA9oZ4iXnC6vBtPyE',
         },
         data: { action: 'sweep', lamports: 4850000000, note: '98% of wallet balance' },
-      },
-    ],
-  },
-  null,
-  2
-);
-
-const SAFE_SAMPLE = JSON.stringify(
-  {
-    network: 'devnet',
-    feePayer: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU',
-    recentBlockhash: 'EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N',
-    instructions: [
-      {
-        programId: '11111111111111111111111111111111',
-        type: 'transfer',
-        accounts: {
-          from: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU',
-          to: 'GrDMoeqMLFjeXQ24H56S1RLgT4R76jsuWCd6SvXyGPQ5',
-        },
-        data: { lamports: 50000000 },
-      },
-      {
-        programId: 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',
-        type: 'memo',
-        data: { text: 'Coffee payment' },
       },
     ],
   },
@@ -181,6 +215,13 @@ const REC_STYLES: Record<Recommendation, RecStyle> = {
       'border-red-500/60 bg-red-500/10 text-red-300 shadow-[0_0_40px_-10px_rgba(239,68,68,0.65)]',
     dot: 'bg-red-500',
   },
+};
+
+const TX_STATUS_STYLES: Record<TxStatus['kind'], string> = {
+  pending: 'border-cyan-400/40 bg-cyan-400/10 text-cyan-200',
+  success: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200',
+  blocked: 'border-red-500/40 bg-red-500/10 text-red-200',
+  error: 'border-amber-400/40 bg-amber-400/10 text-amber-200',
 };
 
 const DEFAULT_SCORES: Record<RiskLevel, number> = {
@@ -402,7 +443,8 @@ function RiskGauge({ score, color, label }: { score: number; color: string; labe
 /* ------------------------------------------------------------------ */
 
 export default function Home() {
-  const { publicKey } = useWallet();
+  const { publicKey, sendTransaction } = useWallet();
+  const { connection } = useConnection();
 
   const [payload, setPayload] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
@@ -412,6 +454,13 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [scanned, setScanned] = useState<number>(1420);
   const [reportMeta, setReportMeta] = useState<ReportMeta | null>(null);
+  const [sending, setSending] = useState<boolean>(false);
+  const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
+  const [liveOpen, setLiveOpen] = useState<boolean>(false);
+  const [recipientInput, setRecipientInput] = useState<string>('');
+  const [amountInput, setAmountInput] = useState<string>('0.1');
+  const [formError, setFormError] = useState<string | null>(null);
+  const [cautionTx, setCautionTx] = useState<{ transaction: Transaction; audit: AnalysisResult } | null>(null);
 
   /* Cycle through status messages while the AI works. */
   useEffect(() => {
@@ -429,6 +478,16 @@ export default function Home() {
     return () => cancelAnimationFrame(id);
   }, [result]);
 
+  /* Close the live-check dialog with Escape. */
+  useEffect(() => {
+    if (!liveOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLiveOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [liveOpen]);
+
   const walletLabel = useMemo(() => {
     if (!publicKey) return null;
     const b58 = publicKey.toBase58();
@@ -445,9 +504,9 @@ export default function Home() {
     void runAnalysis(payload);
   }
 
-  async function runAnalysis(raw: string) {
+  async function runAnalysis(raw: string): Promise<AnalysisResult | null> {
     const trimmed = raw.trim();
-    if (!trimmed || loading) return;
+    if (!trimmed || loading) return null;
 
     // If it looks like JSON, make sure it parses before spending an API call.
     let body: unknown = trimmed;
@@ -457,7 +516,7 @@ export default function Home() {
       } catch {
         setError('That payload is not valid JSON. Fix the syntax or load a sample.');
         setResult(null);
-        return;
+        return null;
       }
     }
 
@@ -490,19 +549,22 @@ export default function Home() {
       }
 
       const data: unknown = await res.json();
-      setResult(normalizeResult(data));
+      const normalized = normalizeResult(data);
+      setResult(normalized);
       setReportMeta({
         payload: trimmed,
         at: new Date().toISOString(),
         wallet: publicKey ? publicKey.toBase58() : null,
       });
       setScanned((n) => n + 1);
+      return normalized;
     } catch (err) {
       setError(
         err instanceof Error
           ? err.message
           : 'The analysis failed. Check that /api/analyze is running and try again.'
       );
+      return null;
     } finally {
       setLoading(false);
     }
@@ -519,26 +581,56 @@ export default function Home() {
     downloadTextFile(`agentguard-audit-${stamp}.md`, buildMarkdownReport(result, meta));
   }
 
-  function handleLiveWalletCheck() {
+  function openLiveModal() {
+    if (loading || sending) return;
     if (!publicKey) {
-      window.alert('Please connect your Phantom wallet first!');
+      setTxStatus({ kind: 'error', message: 'Please connect your Phantom wallet first!' });
+      return;
+    }
+    setFormError(null);
+    setLiveOpen(true);
+  }
+
+  async function submitLiveForm(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!publicKey) {
+      setFormError('Connect your Phantom wallet first.');
       return;
     }
 
+    let recipient: PublicKey;
     try {
-      // Build a real 0.1 SOL transfer from the connected wallet. Nothing is signed or sent.
-      const instruction = SystemProgram.transfer({
-        fromPubkey: publicKey,
-        toPubkey: new PublicKey(LIVE_TEST_DESTINATION),
-        lamports: LIVE_TEST_LAMPORTS,
-      });
-      const tx = new Transaction().add(instruction);
-      tx.feePayer = publicKey;
+      recipient = new PublicKey(recipientInput.trim());
+    } catch {
+      setFormError('That is not a valid Solana address.');
+      return;
+    }
 
-      const live = {
+    const sol = Number(amountInput.trim());
+    const lamports = Math.round(sol * LAMPORTS_PER_SOL);
+    if (!Number.isFinite(sol) || sol <= 0 || !Number.isSafeInteger(lamports) || lamports <= 0) {
+      setFormError('Enter an amount greater than 0.');
+      return;
+    }
+
+    setFormError(null);
+    setLiveOpen(false);
+
+    // Build the real transfer. This exact object is what gets audited and, if safe, signed.
+    const instruction = SystemProgram.transfer({
+      fromPubkey: publicKey,
+      toPubkey: recipient,
+      lamports,
+    });
+    const transaction = new Transaction().add(instruction);
+    transaction.feePayer = publicKey;
+
+    // Serialize to readable JSON, show it in the textarea, and audit it.
+    const json = JSON.stringify(
+      {
         network: 'devnet',
-        source: 'live-wallet-intercept',
-        feePayer: tx.feePayer.toBase58(),
+        source: 'live-target-check',
+        feePayer: publicKey.toBase58(),
         instructions: [
           {
             programId: instruction.programId.toBase58(),
@@ -550,28 +642,83 @@ export default function Home() {
             data: Array.from(instruction.data, (b: number) => b.toString(16).padStart(2, '0')).join(''),
             decoded: {
               instruction: 'SystemProgram.transfer',
-              lamports: LIVE_TEST_LAMPORTS,
-              sol: LIVE_TEST_LAMPORTS / 1e9,
+              lamports,
+              sol: lamports / LAMPORTS_PER_SOL,
               from: publicKey.toBase58(),
-              to: LIVE_TEST_DESTINATION,
+              to: recipient.toBase58(),
             },
           },
         ],
-      };
+      },
+      null,
+      2
+    );
+    setPayload(json);
+    setTxStatus(null);
 
-      const json = JSON.stringify(live, null, 2);
-      setPayload(json);
-      void runAnalysis(json);
-    } catch (err) {
-      setResult(null);
-      setError(
-        err instanceof Error ? `Could not build the live transaction: ${err.message}` : 'Could not build the live transaction.'
-      );
+    const audit = await runAnalysis(json);
+    if (!audit) return; // the report card already shows what went wrong
+
+    if (audit.recommendation === 'BLOCK') {
+      setTxStatus({
+        kind: 'blocked',
+        message: `Blocked by AgentGuard AI (${audit.riskLevel} risk). Nothing was sent.`,
+      });
+      return;
     }
+
+    if (audit.recommendation === 'PROCEED_WITH_CAUTION') {
+      setCautionTx({ transaction, audit }); // wait for an explicit decision in the dialog
+      return;
+    }
+
+    await broadcastTransaction(transaction);
+  }
+
+  async function broadcastTransaction(transaction: Transaction) {
+    if (!publicKey) return;
+    setSending(true);
+    try {
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = publicKey;
+
+      const signature = await sendTransaction(transaction, connection);
+      setTxStatus({ kind: 'pending', message: 'Submitted. Waiting for confirmation…', signature });
+
+      const confirmation = await connection.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight },
+        'confirmed'
+      );
+      if (confirmation.value.err) {
+        throw new Error('The transaction was rejected by the network.');
+      }
+      setTxStatus({ kind: 'success', message: 'Verified safe, signed, and confirmed on Devnet.', signature });
+    } catch (err) {
+      setTxStatus({
+        kind: 'error',
+        message: err instanceof Error ? err.message : 'The transaction could not be sent.',
+      });
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function confirmCaution() {
+    if (!cautionTx) return;
+    const { transaction } = cautionTx;
+    setCautionTx(null);
+    void broadcastTransaction(transaction);
+  }
+
+  function cancelCaution() {
+    setCautionTx(null);
+    setTxStatus({ kind: 'blocked', message: 'Cancelled after a caution verdict. Nothing was sent.' });
   }
 
   function loadSample(sample: string) {
     setPayload(sample);
+    setTxStatus(null);
     setResult(null);
     setError(null);
   }
@@ -582,18 +729,28 @@ export default function Home() {
   return (
     <div className="relative min-h-screen overflow-hidden bg-zinc-950 text-zinc-100 antialiased">
       {/* Background glow and grid */}
-      <div aria-hidden="true" className="pointer-events-none absolute inset-0">
-        <div className="absolute -top-40 left-1/2 h[520px] w[820px] -translate-x-1/2 rounded-full bg-cyan-500/10 blur-3xl" />
-        <div className="absolute top-1/3 -right-40 h[420px] w[420px] rounded-full bg-emerald-500/10 blur-3xl" />
-        <div className="absolute bottom-0 -left-40 h[380px] w[380px] rounded-full bg-red-500/5 blur-3xl" />
+      <style>{GLOW_KEYFRAMES}</style>
+      <div
+        aria-hidden="true"
+        style={{ position: 'absolute', inset: 0, overflow: 'hidden', pointerEvents: 'none' }}
+      >
+        {GLOW_LAYERS.map((layer, i) => (
+          <div
+            key={i}
+            className={layer.drift ? 'ag-drift' : undefined}
+            style={{ position: 'absolute', ...layer.style }}
+          />
+        ))}
         <div
-          className="absolute inset-0 opacity-[0.07]"
           style={{
+            position: 'absolute',
+            inset: 0,
+            opacity: 0.05,
             backgroundImage:
               'linear-gradient(to right, #a1a1aa 1px, transparent 1px), linear-gradient(to bottom, #a1a1aa 1px, transparent 1px)',
-            backgroundSize: '56px 56px',
-            maskImage: 'radial-gradient(ellipse at 50% 0%, black 30%, transparent 75%)',
-            WebkitMaskImage: 'radial-gradient(ellipse at 50% 0%, black 30%, transparent 75%)',
+            backgroundSize: '48px 48px',
+            maskImage: 'radial-gradient(ellipse at 50% 0%, black 25%, transparent 70%)',
+            WebkitMaskImage: 'radial-gradient(ellipse at 50% 0%, black 25%, transparent 70%)',
           }}
         />
       </div>
@@ -681,25 +838,18 @@ export default function Home() {
             <div className="mt-5 flex flex-wrap gap-2">
               <button
                 type="button"
+                onClick={openLiveModal}
+                disabled={loading || sending}
+                className="rounded-xl bg-linear-to-r from-cyan-500 to-emerald-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-[0_0_28px_-8px_rgba(34,211,238,0.7)] transition-all duration-300 ease-in-out hover:-translate-y-0.5 hover:shadow-[0_0_36px_-6px_rgba(52,211,153,0.8)] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:translate-y-0"
+              >
+                🛡️ Live Target Check &amp; Transfer
+              </button>
+              <button
+                type="button"
                 onClick={() => loadSample(RISKY_SAMPLE)}
                 className="rounded-xl border border-red-500/40 bg-red-500/10 px-3.5 py-2 text-sm font-medium text-red-300 transition-all duration-300 ease-in-out hover:-translate-y-0.5 hover:bg-red-500/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
               >
-                Load risky sample
-              </button>
-              <button
-                type="button"
-                onClick={handleLiveWalletCheck}
-                disabled={loading}
-                className="rounded-xl border border-cyan-400/40 bg-cyan-400/10 px-3.5 py-2 text-sm font-medium text-cyan-300 transition-all duration-300 ease-in-out hover:-translate-y-0.5 hover:bg-cyan-400/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:translate-y-0"
-              >
-                ⚡ Intercept Live Phantom Tx
-              </button>
-              <button
-                type="button"
-                onClick={() => loadSample(SAFE_SAMPLE)}
-                className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-2 text-sm font-medium text-emerald-300 transition-all duration-300 ease-in-out hover:-translate-y-0.5 hover:bg-emerald-500/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
-              >
-                Load safe sample
+                🚨 Attack Sample
               </button>
               {payload && (
                 <button
@@ -746,6 +896,22 @@ export default function Home() {
                 </>
               )}
             </button>
+
+            {txStatus && (
+              <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${TX_STATUS_STYLES[txStatus.kind]}`} role="status">
+                <p className="font-medium">{txStatus.message}</p>
+                {txStatus.signature && (
+                  <a
+                    href={`https://explorer.solana.com/tx/${txStatus.signature}?cluster=devnet`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-1 inline-block font-mono text-xs underline underline-offset-2"
+                  >
+                    {txStatus.signature.slice(0, 8)}…{txStatus.signature.slice(-8)} · view on Solana Explorer
+                  </a>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Report card */}
@@ -875,6 +1041,123 @@ export default function Home() {
       <footer className="relative z-10 border-t border-zinc-800 py-8 text-center text-xs text-zinc-500">
         AgentGuard AI runs on Solana Devnet. Reports are advisory, so review every transaction yourself.
       </footer>
+
+      {/* Live target check dialog */}
+      {liveOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="live-title">
+          <button
+            type="button"
+            aria-label="Close dialog"
+            onClick={() => setLiveOpen(false)}
+            className="absolute inset-0 cursor-default bg-zinc-950/80 backdrop-blur-sm"
+          />
+          <form
+            onSubmit={(e) => void submitLiveForm(e)}
+            className="relative w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900/95 p-6 shadow-[0_0_80px_-20px_rgba(34,211,238,0.35)] backdrop-blur-md"
+          >
+            <h2 id="live-title" className="text-lg font-semibold tracking-tight">
+              Live target check
+            </h2>
+            <p className="mt-1 text-sm text-zinc-400">
+              AgentGuard audits the transfer first. Phantom only opens if the verdict is safe.
+            </p>
+
+            <label htmlFor="live-recipient" className="mt-5 block text-sm font-medium text-zinc-300">
+              Recipient address
+            </label>
+            <input
+              id="live-recipient"
+              autoFocus
+              value={recipientInput}
+              onChange={(e) => setRecipientInput(e.target.value)}
+              placeholder="Paste a Solana wallet address"
+              spellCheck={false}
+              autoComplete="off"
+              className="mt-1.5 w-full rounded-xl border border-zinc-800 bg-zinc-950/80 px-3.5 py-2.5 font-mono text-xs text-cyan-100 placeholder-zinc-600 transition-all duration-300 ease-in-out focus:border-cyan-500/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/20"
+            />
+
+            <label htmlFor="live-amount" className="mt-4 block text-sm font-medium text-zinc-300">
+              Amount (SOL)
+            </label>
+            <input
+              id="live-amount"
+              inputMode="decimal"
+              value={amountInput}
+              onChange={(e) => setAmountInput(e.target.value)}
+              autoComplete="off"
+              className="mt-1.5 w-full rounded-xl border border-zinc-800 bg-zinc-950/80 px-3.5 py-2.5 font-mono text-sm text-cyan-100 transition-all duration-300 ease-in-out focus:border-cyan-500/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/20"
+            />
+
+            {formError && (
+              <p className="mt-3 rounded-xl border border-red-500/40 bg-red-500/10 px-3.5 py-2 text-sm text-red-300" role="alert">
+                {formError}
+              </p>
+            )}
+
+            <div className="mt-6 flex gap-3">
+              <button
+                type="button"
+                onClick={() => setLiveOpen(false)}
+                className="h-11 flex-1 rounded-xl border border-zinc-700 text-sm font-medium text-zinc-300 transition-all duration-300 ease-in-out hover:border-zinc-600 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="h-11 flex-1 rounded-xl bg-linear-to-r from-cyan-500 to-emerald-500 text-sm font-semibold text-zinc-950 transition-all duration-300 ease-in-out hover:-translate-y-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300"
+              >
+                Audit &amp; continue
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Caution verdict dialog */}
+      {cautionTx && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="alertdialog" aria-modal="true" aria-labelledby="caution-title">
+          <div className="absolute inset-0 bg-zinc-950/80 backdrop-blur-sm" />
+          <div className="relative w-full max-w-md rounded-xl border border-amber-400/40 bg-zinc-900/95 p-6 shadow-[0_0_80px_-20px_rgba(251,191,36,0.4)] backdrop-blur-md">
+            <h2 id="caution-title" className="text-lg font-semibold tracking-tight text-amber-200">
+              AgentGuard flagged this transfer
+            </h2>
+            <p className="mt-1 text-sm text-zinc-400">
+              {cautionTx.audit.riskLevel} risk, score {cautionTx.audit.riskScore}/100
+            </p>
+            <p className="mt-4 text-sm leading-relaxed text-zinc-200">{cautionTx.audit.summary}</p>
+            {cautionTx.audit.warnings.length > 0 && (
+              <ul className="mt-3 space-y-2">
+                {cautionTx.audit.warnings.map((w, i) => (
+                  <li
+                    key={`${i}-${w.slice(0, 24)}`}
+                    className="flex items-start gap-2.5 rounded-xl border border-zinc-800 bg-zinc-950/60 px-3.5 py-2.5 text-sm text-zinc-200"
+                  >
+                    <AlertIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <span className="leading-relaxed">{w}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="mt-6 flex gap-3">
+              <button
+                type="button"
+                onClick={cancelCaution}
+                autoFocus
+                className="h-11 flex-1 rounded-xl bg-linear-to-r from-cyan-500 to-emerald-500 text-sm font-semibold text-zinc-950 transition-all duration-300 ease-in-out hover:-translate-y-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300"
+              >
+                Cancel transfer
+              </button>
+              <button
+                type="button"
+                onClick={confirmCaution}
+                className="h-11 flex-1 rounded-xl border border-amber-400/50 bg-amber-400/10 text-sm font-medium text-amber-200 transition-all duration-300 ease-in-out hover:bg-amber-400/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
+              >
+                Sign anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
