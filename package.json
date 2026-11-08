@@ -9,6 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@solana/wallet-adapter-base": "^0.9.28",
+    "@solana/wallet-adapter-react": "^0.15.40",
+    "@solana/wallet-adapter-react-ui": "^0.9.40",
+    "groq-sdk": "^1.6.0",
     "next": "16.4.5",
     "react": "19.3.0",
     "react-dom": "19.3.0"
